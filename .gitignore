@@ -1,0 +1,4 @@
+/chats/
+/ollama-python-ref/
+.DS_Store
+__pycache__/
