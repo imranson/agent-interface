@@ -14,19 +14,20 @@ MODEL = "minimax-m3:cloud"
 with open(os.path.join(os.path.dirname(__file__), "prompts", "default-system-prompt-1.md"), "r") as _f:
     SYSTEM_PROMPT = _f.read()
 TIMESTAMP_FORMAT = "<system_time>%A %Y-%m-%d %H:%M:%S %Z</system_time>"
-CHATS_DIR = os.path.join(os.path.dirname(__file__), "chats")
-
-os.makedirs(CHATS_DIR, exist_ok=True)
 
 MARKITDOWN = MarkItDown()
 
 # Authenticated client for web_search / web_fetch (requires OLLAMA_API_KEY)
-_OLLAMA_API_KEY = os.getenv("OLLAMA_API_KEY")
+_OLLAMA_API_KEY = st.secrets.get("OLLAMA_API_KEY")
 if _OLLAMA_API_KEY:
-    _client = Client(headers={"Authorization": f"Bearer {_OLLAMA_API_KEY}"})
+    _client = Client(host="https://ollama.com",
+                     headers={"Authorization": f"Bearer {_OLLAMA_API_KEY}"})
 else:
-    _client = Client()
+    _client = None
 
+if _client is None:
+    st.error("OLLAMA_API_KEY is not configured. Add it in Settings → Secrets.")
+    st.stop()
 
 @dataclass
 class ChatConfig:
@@ -111,6 +112,10 @@ def convert_upload(uploaded) -> str:
     return MARKITDOWN.convert_stream(uploaded, file_extension=ext).text_content
 
 
+def _generate_chat_id() -> str:
+    return uuid.uuid4().hex[:8]
+
+
 def build_user_message(prompt: str, uploaded) -> tuple[dict, str | None]: #build query + context
     if uploaded is None:
         return {"role": "user", "content": prompt}, None
@@ -134,14 +139,6 @@ def build_user_message(prompt: str, uploaded) -> tuple[dict, str | None]: #build
     return message, None
 
 
-def _chat_path(chat_id: str) -> str:
-    return os.path.join(CHATS_DIR, f"{chat_id}.json")
-
-
-def _generate_chat_id() -> str:
-    return uuid.uuid4().hex[:8]
-
-
 def _chat_title(messages: list[dict]) -> str:
     for msg in messages:
         if msg["role"] == "user":
@@ -150,50 +147,33 @@ def _chat_title(messages: list[dict]) -> str:
 
 
 def list_saved_chats() -> list[dict]:
-    chats = []
-    for filename in os.listdir(CHATS_DIR):
-        if not filename.endswith(".json"):
-            continue
-        path = os.path.join(CHATS_DIR, filename)
-        try:
-            with open(path, "r") as f:
-                data = json.load(f)
-            chats.append({
-                "id": data.get("id", filename[:-5]),
-                "title": data.get("title", "Untitled"),
-                "updated_at": data.get("updated_at", ""),
-            })
-        except Exception:
-            continue
-    chats.sort(key=lambda c: c["updated_at"], reverse=True)
-    return chats
+    chats = st.session_state.get("chats", {})
+    summaries = [
+        {"id": cid, "title": data.get("title", "Untitled"), "updated_at": data.get("updated_at", "")}
+        for cid, data in chats.items()
+    ]
+    summaries.sort(key=lambda c: c["updated_at"], reverse=True)
+    return summaries
 
 
 def load_chat(chat_id: str) -> list[dict]:
-    path = _chat_path(chat_id)
-    if not os.path.exists(path):
-        return []
-    with open(path, "r") as f:
-        data = json.load(f)
-    return data.get("messages", [])
+    chats = st.session_state.get("chats", {})
+    return chats.get(chat_id, {}).get("messages", [])
 
 
 def save_chat(chat_id: str, messages: list[dict]) -> None:
-    path = _chat_path(chat_id)
-    data = {
+    chats = st.session_state.setdefault("chats", {})
+    chats[chat_id] = {
         "id": chat_id,
         "title": _chat_title(messages),
         "messages": messages,
         "updated_at": datetime.now().isoformat(),
     }
-    with open(path, "w") as f:
-        json.dump(data, f, indent=2)
 
 
 def delete_chat(chat_id: str) -> None:
-    path = _chat_path(chat_id)
-    if os.path.exists(path):
-        os.remove(path)
+    chats = st.session_state.get("chats", {})
+    chats.pop(chat_id, None)
 
 
 def render_sidebar() -> ChatConfig:
