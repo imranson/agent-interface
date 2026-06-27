@@ -11,6 +11,8 @@ from ollama import Client, WebSearchResponse, WebFetchResponse
 from markitdown import MarkItDown
 
 MODEL = "minimax-m3:cloud"
+TOOL_RESULT_LIMIT = 16000
+
 with open(os.path.join(os.path.dirname(__file__), "prompts", "default-system-prompt-1.md"), "r") as _f:
     SYSTEM_PROMPT = _f.read()
 TIMESTAMP_FORMAT = "<system_time>%A %Y-%m-%d %H:%M:%S %Z</system_time>"
@@ -441,7 +443,7 @@ def main() -> None:
                                 try:
                                     result = tool_fn(**args)
                                     formatted = format_tool_results(result, args.get("query", "") or args.get("url", ""))
-                                    capped = formatted[:8000]
+                                    capped = formatted[:TOOL_RESULT_LIMIT]
                                 except Exception as e:
                                     capped = f"Error calling {name}: {e}"
                             else:
