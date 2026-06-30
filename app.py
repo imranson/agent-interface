@@ -11,7 +11,7 @@ from ollama import Client, WebSearchResponse, WebFetchResponse
 from markitdown import MarkItDown
 
 MODEL = "minimax-m3:cloud"
-TOOL_RESULT_LIMIT = 40000
+TOOL_RESULT_LIMIT = 4000000
 with open(os.path.join(os.path.dirname(__file__), "prompts", "default-system-prompt-1.md"), "r") as _f:
     SYSTEM_PROMPT = _f.read()
 TIMESTAMP_FORMAT = "<system_time>%A %Y-%m-%d %H:%M:%S %Z</system_time>"
