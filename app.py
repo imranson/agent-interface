@@ -12,17 +12,20 @@ from markitdown import MarkItDown
 
 MODEL = "minimax-m3:cloud"
 TOOL_RESULT_LIMIT = 4000000
+HANDOFF_TOKEN_THRESHOLD = 100_000
 
 with open(os.path.join(os.path.dirname(__file__), "prompts", "default-system-prompt-1.md"), "r") as _f:
     SYSTEM_PROMPT = _f.read()
+with open(os.path.join(os.path.dirname(__file__), "prompts", "handoff-system-prompt.md"), "r") as _f:
+    HANDOFF_PROMPT = _f.read()
+with open(os.path.join(os.path.dirname(__file__), "prompts", "predecessor-system-prompt.md"), "r") as _f:
+    PREDECESSOR_PROMPT = _f.read()
 TIMESTAMP_FORMAT = "<system_time>%A %Y-%m-%d %H:%M:%S %Z</system_time>"
 CHATS_DIR = os.path.join(os.path.dirname(__file__), "chats")
 
 os.makedirs(CHATS_DIR, exist_ok=True)
 
 MARKITDOWN = MarkItDown()
-
-# Authenticated client for web_search / web_fetch (requires OLLAMA_API_KEY)
 _OLLAMA_API_KEY = os.getenv("OLLAMA_API_KEY")
 if _OLLAMA_API_KEY:
     _client = Client(headers={"Authorization": f"Bearer {_OLLAMA_API_KEY}"})
@@ -60,7 +63,81 @@ class ChatConfig:
         }
 
 
-TOOL_MAP = {"web_search": _client.web_search, "web_fetch": _client.web_fetch}
+def ask_predecessor_tool(question: str) -> str:
+    """Top-level wrapper used as the ask_predecessor tool. Reads from session state."""
+    return query_predecessor(
+        st.session_state.agents,
+        st.session_state.messages,
+        st.session_state.current_agent_id,
+        question,
+        st.session_state["_config"],
+    )
+
+
+def _current_agent() -> dict:
+    return next(a for a in st.session_state.agents if a["id"] == st.session_state.current_agent_id)
+
+
+def _maybe_handoff(config: ChatConfig) -> None:
+    current = _current_agent()
+    if current.get("handed_off"):
+        return
+
+    system_prompt = assemble_system_prompt(current["id"], st.session_state.agents)
+    budget = [{"role": "system", "content": system_prompt}, *st.session_state.messages]
+    used = estimate_messages_tokens(budget)
+    if used < HANDOFF_TOKEN_THRESHOLD:
+        return
+
+    first = current.get("first_message_index", 0)
+    last = len(st.session_state.messages) - 1
+    with st.spinner(f"Writing handoff for {current['id']}…"):
+        try:
+            report = write_handoff(current, st.session_state.messages[first:last + 1], config)
+        except Exception as e:
+            st.error(f"Handoff failed: {e}")
+            return
+
+    now = datetime.now().isoformat()
+    current["handed_off"] = True
+    current["ended_at"] = now
+    current["handoff_report"] = report
+    current["last_message_index"] = last
+
+    new_agent = {
+        "id": _agent_id(len(st.session_state.agents) + 1),
+        "started_at": now,
+        "ended_at": "",
+        "handed_off": False,
+        "handoff_report": "",
+        "first_message_index": last + 1,
+        "last_message_index": last,
+    }
+    st.session_state.agents.append(new_agent)
+    st.session_state.current_agent_id = new_agent["id"]
+
+    st.session_state["_pending_handoff"] = {
+        "agent_id": current["id"],
+        "report": report,
+        "tokens": used,
+    }
+
+
+def _render_pending_handoff() -> None:
+    pending = st.session_state.pop("_pending_handoff", None)
+    if not pending:
+        return
+    with st.chat_message("system"):
+        st.markdown(f"📋 **Handoff from {pending['agent_id']}** — work passed to next agent (~{pending['tokens']:,} tokens)")
+        with st.expander("Handoff report", expanded=False):
+            st.markdown(pending["report"])
+
+
+TOOL_MAP = {
+    "web_search": _client.web_search,
+    "web_fetch": _client.web_fetch,
+    "ask_predecessor": ask_predecessor_tool,
+}
 
 
 def format_tool_results(results: Union[WebSearchResponse, WebFetchResponse, object], user_search: str) -> str:
@@ -171,21 +248,48 @@ def list_saved_chats() -> list[dict]:
     return chats
 
 
-def load_chat(chat_id: str) -> list[dict]:
+def _agent_id(n: int) -> str:
+    return f"agent_{n:03d}"
+
+
+def _default_agent(messages: list[dict]) -> tuple[list[dict], str]:
+    last = max(len(messages) - 1, 0)
+    return (
+        [{
+            "id": _agent_id(1),
+            "started_at": "",
+            "ended_at": "",
+            "handed_off": False,
+            "handoff_report": "",
+            "first_message_index": 0,
+            "last_message_index": last,
+        }],
+        _agent_id(1),
+    )
+
+
+def load_chat(chat_id: str) -> tuple[list[dict], list[dict], str]:
     path = _chat_path(chat_id)
     if not os.path.exists(path):
-        return []
+        return [], [], _agent_id(1)
     with open(path, "r") as f:
         data = json.load(f)
-    return data.get("messages", [])
+    messages = data.get("messages", [])
+    agents = data.get("agents")
+    current_agent_id = data.get("current_agent_id")
+    if not agents or not current_agent_id:
+        agents, current_agent_id = _default_agent(messages)
+    return messages, agents, current_agent_id
 
 
-def save_chat(chat_id: str, messages: list[dict]) -> None:
+def save_chat(chat_id: str, messages: list[dict], agents: list[dict], current_agent_id: str) -> None:
     path = _chat_path(chat_id)
     data = {
         "id": chat_id,
         "title": _chat_title(messages),
         "messages": messages,
+        "agents": agents,
+        "current_agent_id": current_agent_id,
         "updated_at": datetime.now().isoformat(),
     }
     with open(path, "w") as f:
@@ -205,6 +309,8 @@ def render_sidebar() -> ChatConfig:
         if st.button("+ New Chat", use_container_width=True):
             st.session_state.chat_id = _generate_chat_id()
             st.session_state.messages = []
+            st.session_state.agents = [_default_agent([])[0][0]]
+            st.session_state.current_agent_id = _agent_id(1)
             st.rerun()
 
         st.divider()
@@ -216,7 +322,10 @@ def render_sidebar() -> ChatConfig:
                 label = f"{chat['title']}"
                 if st.button(label, key=f"load_{chat['id']}", use_container_width=True):
                     st.session_state.chat_id = chat["id"]
-                    st.session_state.messages = load_chat(chat["id"])
+                    msgs, ags, cur = load_chat(chat["id"])
+                    st.session_state.messages = msgs
+                    st.session_state.agents = ags
+                    st.session_state.current_agent_id = cur
                     st.rerun()
             with col2:
                 if st.button("🗑", key=f"del_{chat['id']}", help="Delete chat"):
@@ -224,6 +333,8 @@ def render_sidebar() -> ChatConfig:
                     if st.session_state.get("chat_id") == chat["id"]:
                         st.session_state.chat_id = _generate_chat_id()
                         st.session_state.messages = []
+                        st.session_state.agents = [_default_agent([])[0][0]]
+                        st.session_state.current_agent_id = _agent_id(1)
                     st.rerun()
 
         st.divider()
@@ -234,12 +345,23 @@ def render_sidebar() -> ChatConfig:
         num_ctx = st.number_input("num_ctx", min_value=1, value=ChatConfig.num_ctx, step=256)
 
         st.subheader("Context Usage")
-        outgoing_preview = [{"role": "system", "content": SYSTEM_PROMPT}] + list(st.session_state.get("messages", []))
-        used_tokens = estimate_messages_tokens(outgoing_preview)
+        agents = st.session_state.get("agents") or []
+        current_id = st.session_state.get("current_agent_id")
+        current = next((a for a in agents if a["id"] == current_id), None) if current_id else None
+        first = current.get("first_message_index", 0) if current else 0
+        current_slice = st.session_state.get("messages", [])[first:]
+        system_prompt = assemble_system_prompt(current_id or _agent_id(1), agents)
+        budget = [{"role": "system", "content": system_prompt}, *current_slice]
+        used_tokens = estimate_messages_tokens(budget)
         ctx_tokens = int(num_ctx)
         pct = min(used_tokens / ctx_tokens, 1.0) if ctx_tokens else 0.0
         st.progress(pct)
-        st.caption(f"~{used_tokens:,} / {ctx_tokens:,} tokens ({pct:.0%})")
+        prior = [a for a in agents if a.get("handed_off") and a.get("handoff_report")]
+        st.caption(
+            f"~{used_tokens:,} / {ctx_tokens:,} tokens ({pct:.0%})  ·  "
+            f"handoff at {HANDOFF_TOKEN_THRESHOLD:,}  ·  "
+            f"{len(prior)} handoff(s)  ·  agent {current_id or '-'}"
+        )
 
         st.subheader("Runtime Options")
         think = st.toggle("Enable thinking mode", value=ChatConfig.think)
@@ -278,27 +400,49 @@ def render_sidebar() -> ChatConfig:
     return config
 
 
-def render_messages(messages: list[dict]) -> None:
-    for message in messages:
-        role = message["role"]
-        if role == "tool":
-            continue
-        with st.chat_message(role):
-            if message.get("attachments"):
-                st.caption("📎 " + ", ".join(a["name"] for a in message["attachments"]))
-            if message.get("thinking"):
-                with st.expander("Thinking", expanded=False):
-                    st.code(message["thinking"])
-            if message.get("tool_calls"):
-                for tc in message["tool_calls"]:
-                    name = tc.get("function", {}).get("name", "unknown")
-                    args = tc.get("function", {}).get("arguments", {})
-                    args_str = ", ".join(f"{k}={v!r}" for k, v in args.items())
-                    st.caption(f"🔧 Tool call: `{name}({args_str})`")
-            if message.get("content"):
-                st.markdown(message["content"])
-            elif not message.get("thinking") and not message.get("tool_calls"):
-                st.markdown("*No content*")
+def _render_message(message: dict) -> None:
+    role = message["role"]
+    if role == "tool":
+        return
+    with st.chat_message(role):
+        if message.get("attachments"):
+            st.caption("📎 " + ", ".join(a["name"] for a in message["attachments"]))
+        if message.get("thinking"):
+            with st.expander("Thinking", expanded=False):
+                st.code(message["thinking"])
+        if message.get("tool_calls"):
+            for tc in message["tool_calls"]:
+                name = tc.get("function", {}).get("name", "unknown")
+                args = tc.get("function", {}).get("arguments", {})
+                args_str = ", ".join(f"{k}={v!r}" for k, v in args.items())
+                st.caption(f"🔧 Tool call: `{name}({args_str})`")
+        if message.get("content"):
+            st.markdown(message["content"])
+        elif not message.get("thinking") and not message.get("tool_calls"):
+            st.markdown("*No content*")
+
+
+def render_messages(messages: list[dict], agents: list[dict]) -> None:
+    """Render messages grouped by agent, with a handoff card at the end of each
+    handed-off agent's slice."""
+    for agent in agents:
+        first = agent.get("first_message_index", 0)
+        last = agent.get("last_message_index", len(messages) - 1)
+        for m in messages[first:last + 1]:
+            _render_message(m)
+        if agent.get("handed_off") and agent.get("handoff_report"):
+            with st.chat_message("system"):
+                st.markdown(
+                    f"📋 **Handoff from {agent['id']}** — {last - first + 1} messages, "
+                    f"passed to {agents[agents.index(agent) + 1]['id']}"
+                )
+                with st.expander("Handoff report", expanded=False):
+                    st.markdown(agent["handoff_report"])
+                with st.expander(f"Raw messages ({last - first + 1})", expanded=False):
+                    for m in messages[first:last + 1]:
+                        if m.get("role") == "tool":
+                            continue
+                        st.markdown(f"**{m['role']}**: {m.get('content', '')}")
 
 
 def stream_with_thinking(stream) -> tuple[str, str]:
@@ -344,7 +488,7 @@ def run_agent_turn(api_messages: list[dict], config: ChatConfig) -> tuple[str, s
         stream=True,
         options=config.to_ollama_options(),
         think=config.think,
-        tools=[_client.web_search, _client.web_fetch],
+        tools=[_client.web_search, _client.web_fetch, ask_predecessor_tool],
     )
 
     for chunk in stream:
@@ -377,6 +521,75 @@ def run_agent_turn(api_messages: list[dict], config: ChatConfig) -> tuple[str, s
     return content_text, thinking_text, serializable_tool_calls
 
 
+def _slice_to_messages(messages: list[dict], first: int, last: int) -> list[dict]:
+    """Drop system-only fields (tool messages, attachments metadata) for the seed lists."""
+    out = []
+    for m in messages[first:last + 1]:
+        if m.get("role") == "tool":
+            continue
+        out.append({
+            "role": m["role"],
+            "content": m.get("content", ""),
+        })
+    return out
+
+
+def assemble_system_prompt(current_agent_id: str, agents: list[dict]) -> str:
+    prior = [a for a in agents if a.get("handed_off") and a.get("handoff_report")]
+    parts = [SYSTEM_PROMPT]
+    parts.append(f"\n\n# Handoff reports\n\nYou are {current_agent_id}.")
+    if prior:
+        parts.append("Below are the handoff reports from the agents who came before you, in order:\n")
+        for a in prior:
+            parts.append(f"## {a['id']}\n\n{a['handoff_report']}\n")
+    else:
+        parts.append("You are the first agent. No prior handoff reports.")
+    return "".join(parts)
+
+
+def write_handoff(agent: dict, slice_messages: list[dict], config: ChatConfig) -> str:
+    msgs = [{"role": "system", "content": HANDOFF_PROMPT}]
+    msgs.extend(_slice_to_messages(slice_messages, 0, len(slice_messages) - 1))
+    msgs.append({
+        "role": "user",
+        "content": "These are the messages you owned. Write the handoff report now.",
+    })
+    response = _client.chat(
+        model=MODEL,
+        messages=msgs,
+        stream=False,
+        options=config.to_ollama_options(),
+        think=True,
+    )
+    return response["message"]["content"]
+
+
+def query_predecessor(agents: list[dict], messages: list[dict], current_agent_id: str, question: str, config: ChatConfig) -> str:
+    """Spawn a fresh chat seeded with the previous agent's messages and ask the question."""
+    idx = next((i for i, a in enumerate(agents) if a["id"] == current_agent_id), None)
+    if idx is None or idx == 0:
+        return "No previous agent to query."
+
+    prev = agents[idx - 1]
+    first = prev.get("first_message_index", 0)
+    last = prev.get("last_message_index", first)
+    seed = _slice_to_messages(messages, first, last)
+
+    msgs = [
+        {"role": "system", "content": PREDECESSOR_PROMPT},
+        *seed,
+        {"role": "user", "content": question},
+    ]
+    response = _client.chat(
+        model=MODEL,
+        messages=msgs,
+        stream=False,
+        options=config.to_ollama_options(),
+        think=False,
+    )
+    return response["message"]["content"]
+
+
 def main() -> None:
     st.title("Chat with Ollama")
     config = render_sidebar()
@@ -385,8 +598,14 @@ def main() -> None:
         st.session_state.chat_id = _generate_chat_id()
     if "messages" not in st.session_state:
         st.session_state.messages = []
+    if "agents" not in st.session_state:
+        st.session_state.agents = [_default_agent([])[0][0]]
+    if "current_agent_id" not in st.session_state:
+        st.session_state.current_agent_id = _agent_id(1)
 
-    render_messages(st.session_state.messages)
+    st.session_state["_config"] = config
+
+    render_messages(st.session_state.messages, st.session_state.agents)
 
     uploaded = st.file_uploader("Attach a file", key=f"up_{len(st.session_state.messages)}")
     if prompt := st.chat_input("What do you want to ask?"):
@@ -413,8 +632,10 @@ def main() -> None:
                             "content": f"{stamp}\n{outgoing[i]['content']}",
                         }
                         break
-                if SYSTEM_PROMPT:
-                    outgoing = [{"role": "system", "content": SYSTEM_PROMPT}] + outgoing
+                outgoing = [
+                    {"role": "system", "content": assemble_system_prompt(st.session_state.current_agent_id, st.session_state.agents)},
+                    *outgoing,
+                ]
 
                 if config.enable_tools:
                     # TOOL LOOP
@@ -439,11 +660,15 @@ def main() -> None:
                             args = tc["function"]["arguments"]
                             tool_fn = TOOL_MAP.get(name)
                             if tool_fn:
-                                st.caption(f"🔧 Running {name}({', '.join(f'{k}={v!r}' for k, v in args.items())})...")
+                                args_str = ", ".join(f"{k}={v!r}" for k, v in args.items())
+                                st.caption(f"🔧 Running {name}({args_str})...")
                                 try:
                                     result = tool_fn(**args)
-                                    formatted = format_tool_results(result, args.get("query", "") or args.get("url", ""))
-                                    capped = formatted[:TOOL_RESULT_LIMIT]
+                                    if name in ("web_search", "web_fetch"):
+                                        formatted = format_tool_results(result, args.get("query", "") or args.get("url", ""))
+                                        capped = formatted[:TOOL_RESULT_LIMIT]
+                                    else:
+                                        capped = str(result)[:TOOL_RESULT_LIMIT]
                                 except Exception as e:
                                     capped = f"Error calling {name}: {e}"
                             else:
@@ -474,7 +699,16 @@ def main() -> None:
                         response = stream_without_thinking(stream)
                         st.session_state.messages.append({"role": "assistant", "content": response})
 
-                save_chat(st.session_state.chat_id, st.session_state.messages)
+                _maybe_handoff(config)
+
+                _render_pending_handoff()
+
+                save_chat(
+                    st.session_state.chat_id,
+                    st.session_state.messages,
+                    st.session_state.agents,
+                    st.session_state.current_agent_id,
+                )
             except Exception as e:
                 st.error(f"Ollama error: {e}")
 
