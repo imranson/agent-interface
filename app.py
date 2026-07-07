@@ -17,8 +17,10 @@ with open(os.path.join(os.path.dirname(__file__), "prompts", "default-system-pro
     SYSTEM_PROMPT = _f.read()
 TIMESTAMP_FORMAT = "<system_time>%A %Y-%m-%d %H:%M:%S %Z</system_time>"
 CHATS_DIR = os.path.join(os.path.dirname(__file__), "chats")
+ARCHIVED_DIR = os.path.join(CHATS_DIR, "archived")
 
 os.makedirs(CHATS_DIR, exist_ok=True)
+os.makedirs(ARCHIVED_DIR, exist_ok=True)
 
 MARKITDOWN = MarkItDown()
 
@@ -192,10 +194,11 @@ def save_chat(chat_id: str, messages: list[dict]) -> None:
         json.dump(data, f, indent=2)
 
 
-def delete_chat(chat_id: str) -> None:
+def archive_chat(chat_id: str) -> None:
     path = _chat_path(chat_id)
     if os.path.exists(path):
-        os.remove(path)
+        dest = os.path.join(ARCHIVED_DIR, f"{chat_id}.json")
+        os.rename(path, dest)
 
 
 def render_sidebar() -> ChatConfig:
@@ -219,8 +222,8 @@ def render_sidebar() -> ChatConfig:
                     st.session_state.messages = load_chat(chat["id"])
                     st.rerun()
             with col2:
-                if st.button("🗑", key=f"del_{chat['id']}", help="Delete chat"):
-                    delete_chat(chat["id"])
+                if st.button("📦", key=f"archive_{chat['id']}", help="Archive chat"):
+                    archive_chat(chat["id"])
                     if st.session_state.get("chat_id") == chat["id"]:
                         st.session_state.chat_id = _generate_chat_id()
                         st.session_state.messages = []
