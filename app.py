@@ -10,7 +10,7 @@ import ollama
 from ollama import Client, WebSearchResponse, WebFetchResponse
 from markitdown import MarkItDown
 
-MODEL = "kimi-k3:cloud"
+DEFAULT_MODEL = "kimi-k2.6:cloud"
 TOOL_RESULT_LIMIT = 4000000
 
 with open(os.path.join(os.path.dirname(__file__), "prompts", "default-system-prompt-1.md"), "r") as _f:
@@ -231,7 +231,10 @@ def render_sidebar() -> ChatConfig:
 
         st.divider()
         st.header("Ollama Options")
-        st.markdown(f"**Model:** {MODEL}")
+
+        if "model" not in st.session_state:
+            st.session_state.model = DEFAULT_MODEL
+        st.session_state.model = st.text_input("Model", value=st.session_state.model)
 
         st.subheader("Load Time Options")
         num_ctx = st.number_input("num_ctx", min_value=1, value=ChatConfig.num_ctx, step=256)
@@ -342,7 +345,7 @@ def run_agent_turn(api_messages: list[dict], config: ChatConfig) -> tuple[str, s
     content_placeholder = st.empty()
 
     stream = _client.chat(
-        model=MODEL,
+        model=st.session_state.model,
         messages=api_messages,
         stream=True,
         options=config.to_ollama_options(),
@@ -462,7 +465,7 @@ def main() -> None:
                             # st.caption(f"✅ {name} done")
                 else:
                     stream = _client.chat(
-                        model=MODEL,
+                        model=st.session_state.model,
                         messages=outgoing,
                         stream=True,
                         options=config.to_ollama_options(),
