@@ -1,3 +1,5 @@
+<img width="1271" height="790" alt="Screenshot 2026-08-13 at 17 28 46" src="https://github.com/user-attachments/assets/8a13725e-85d7-47f7-8cb4-a7a6d2d1fd9a" />
+
 Streamlit app using the Ollama Python SDK.
 
 ## Setup
